@@ -1,0 +1,9 @@
+{
+    "id": 2,
+    "text": "I'm here to get an ID.",
+    "emotion": "frustrated",
+    "params": {
+        "samplerate": 16000,
+        "length": 23040
+    }
+}

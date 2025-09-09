@@ -1,0 +1,9 @@
+{
+    "id": 0,
+    "text": "What I'm getting an ID. This is why I'm here. No, my wallet was stolen. I need a",
+    "emotion": "neutral",
+    "params": {
+        "samplerate": 16000,
+        "length": 118784
+    }
+}

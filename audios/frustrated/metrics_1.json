@@ -1,0 +1,9 @@
+{
+    "id": 1,
+    "text": "How am I supposed to get an ID without an ID? How does the person get an ID in the first place?",
+    "emotion": "frustrated",
+    "params": {
+        "samplerate": 16000,
+        "length": 104960
+    }
+}
