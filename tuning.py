@@ -32,7 +32,7 @@ def get_tone_adapter(model, tone: str, gender: str, save_dir="models", r=8, alph
 
     if os.path.exists(os.path.join(tone_dir, "adapter_config.json")):
         print(f"🔄 Loading existing adapter for tone '{tone}' [{gender}] from {tone_dir}")
-        peft_model = PeftModel.from_pretrained(model, tone_dir, adapter_name=tone)
+        peft_model = PeftModel.from_pretrained(model, tone_dir)
     else:
         print(f"✨ Creating new adapter for tone '{tone}' [{gender}]...")
         config = LoraConfig(
@@ -43,10 +43,11 @@ def get_tone_adapter(model, tone: str, gender: str, save_dir="models", r=8, alph
             bias="none",
             task_type="FEATURE_EXTRACTION"
         )
-        peft_model = PeftModel(model, config, adapter_name=tone)
-        gender_dir = os.path.join(save_dir, gender.lower())
-        peft_model.save_pretrained(gender_dir, safe_serialization=True)
-        print(f"✅ Adapter for tone '{tone}' [{gender}] saved at: {gender_dir}")
+        peft_model = PeftModel(model, config)
+        # gender_dir = os.path.join(save_dir, gender.lower())
+
+        peft_model.save_pretrained(tone_dir, safe_serialization=True)
+        print(f"✅ Adapter for tone '{tone}' [{gender}] saved at: {tone_dir}")
 
     return peft_model
 
@@ -139,8 +140,7 @@ def update_emotion_adapters(model, dataset: list, save_dir: str):
             print(f"⚠️ Adapter not found at expected path: {tone_dir}")
             continue
 
-        # 1. Load before-update weights (must define adapter_name here)
-        model_peft = PeftModel.from_pretrained(model, tone_dir, adapter_name=emotion)
+        model_peft = PeftModel.from_pretrained(model, tone_dir)
 
         for name, param in model_peft.named_parameters():
             if "lora" in name:
@@ -152,9 +152,8 @@ def update_emotion_adapters(model, dataset: list, save_dir: str):
             if "lora" in name and param.requires_grad:
                 param.data += 0.01 * features.mean()
 
-        gender_dir = os.path.join(save_dir, gender.lower())
         # 2. Save updated weights back to the same gender/tone subdir
-        model_peft.save_pretrained(gender_dir, safe_serialization=True)
+        model_peft.save_pretrained(tone_dir, safe_serialization=True)
         print(f"💾 Updated adapter saved at {tone_dir}")
 
 # -----------------------------
@@ -164,14 +163,16 @@ if __name__ == "__main__":
     dataset_path = "results.json"
     with open(dataset_path, "r") as f:
         dataset = json.load(f)
-    
-    dataset = dataset[:4]  # Use a subset for quick testing
-    save_dir = "models"
-    
 
-    # Create adapters with gender separation
+    save_dir = "models"
+    processed = set()
+
+    # Only create adapters for unique (gender, major_emotion) pairs
     for item in dataset:
-        _ = get_tone_adapter(base_model, item["major_emotion"], item["gender"], save_dir=save_dir)
+        key = (item["gender"].lower(), item["major_emotion"].lower())
+        if key not in processed:
+            _ = get_tone_adapter(base_model, item["major_emotion"], item["gender"], save_dir=save_dir)
+            processed.add(key)
+        print(f"Processed adapter for {key}")
 
     update_emotion_adapters(base_model, dataset, save_dir=save_dir)
-

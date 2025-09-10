@@ -1,212 +1,248 @@
-import numpy as np
-import whisper
-import soundfile as sf
-from Implicit import extract_prosody_features
-
 import os
 import json
-import torch
 import soundfile as sf
-from torch.utils.data import DataLoader
-from datasets import Dataset
+from tuning import get_tone_adapter, get_speaker_embedding, generate_and_store_speech
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, SpeechT5HifiGan
-from peft import PeftModel, LoraConfig
-from huggingface_hub import hf_hub_download
-import numpy as np
-import zipfile
+from Implicit import extract_prosody_features, voice_to_text, extract_implicit_features
+import torch
+import whisper
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
 
-# -----------------------------
-# Load base SpeechT5 models
-# -----------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+sentiment_pipeline = pipeline(
+    "sentiment-analysis",
+    model="cardiffnlp/twitter-roberta-base-sentiment-latest",
+    device=0 if device == "cuda" else -1
+)
+whisper_model = whisper.load_model("base").to(device)
+
+
+
 processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
 base_model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts")
 vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan")
 
-
-# -----------------------------
-# Create/load LoRA adapter
-# -----------------------------
-def get_tone_adapter(model, tone: str, save_dir="models", r=8, alpha=16, dropout=0.05):
+def calculate_and_store_mean_of_results(results, save_path):
     """
-    Load LoRA adapter if it exists, otherwise create and save it.
+    Calculate the mean of numerical results and store them in a JSON file.
+    Also store the list of all values for each key.
+    Skips non-numerical columns except for 'prosody' (which is processed recursively).
+    For 'features', calculates mean for each index and stores all lists as well.
     """
-    # top-level directory
-    tone_dir = os.path.join(save_dir, tone)
-    os.makedirs(tone_dir, exist_ok=True)
+    if not results:
+        print("No results to process.")
+        return
 
-    # nested path where PEFT actually saves (tone_dir/tone/adapter_config.json)
-    nested_dir = os.path.join(tone_dir, tone)
+    mean_results = {}
+    value_lists = {}
 
-    if os.path.exists(os.path.join(nested_dir, "adapter_config.json")):
-        print(f"🔄 Loading existing adapter for tone '{tone}' from {nested_dir}")
-        peft_model = PeftModel.from_pretrained(model, nested_dir, adapter_name=tone)
-    else:
-        print(f"✨ Creating new adapter for tone '{tone}'...")
-        config = LoraConfig(
-            r=r,
-            lora_alpha=alpha,
-            target_modules=["q_proj", "v_proj"],
-            lora_dropout=dropout,
-            bias="none",
-            task_type="FEATURE_EXTRACTION"
-        )
-        peft_model = PeftModel(model, config, adapter_name=tone)
-        peft_model.save_pretrained(tone_dir, safe_serialization=True)  # PEFT will create tone_dir/tone/
-        print(f"✅ Adapter for tone '{tone}' saved at: {nested_dir}")
+    # Collect all keys except 'text', 'major_emotion', 'gender'
+    keys = set()
+    for result in results:
+        keys.update(result.keys())
+    keys.discard('text')
+    keys.discard('major_emotion')
+    keys.discard('gender')
 
-    return peft_model
+    # Prepare lists for each key
+    for key in keys:
+        if key == "prosody":
+            # Handle nested prosody keys
+            prosody_keys = set()
+            for result in results:
+                if "prosody" in result and isinstance(result["prosody"], dict):
+                    prosody_keys.update(result["prosody"].keys())
+            for pkey in prosody_keys:
+                value_lists[f"prosody.{pkey}"] = []
+        elif key == "features":
+            value_lists["features"] = []
+        else:
+            value_lists[key] = []
 
-# -----------------------------
-# Speaker embedding loader
-# -----------------------------
-def get_speaker_embedding(cache_path="speaker_embedding.npy"):
-    if os.path.exists(cache_path):
-        xvector = np.load(cache_path)
-    else:
-        try:
-            from datasets import load_dataset
-            embeddings_dataset = load_dataset("Matthijs/cmu-arctic-xvectors", split="validation")
-            xvector = embeddings_dataset[7306]["xvector"]
-        except Exception:
-            zip_path = hf_hub_download("Matthijs/cmu-arctic-xvectors", "spkrec-xvect.zip", repo_type="dataset")
-            extract_dir = "cmu-arctic-xvectors"
-            os.makedirs(extract_dir, exist_ok=True)
-            with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                zip_ref.extractall(extract_dir)
-            npy_files = [os.path.join(root, f)
-                         for root, _, files in os.walk(extract_dir) for f in files if f.endswith(".npy")]
-            if not npy_files:
-                raise RuntimeError("No .npy files found in speaker embeddings.")
-            xvector = np.load(npy_files[0])
-        np.save(cache_path, xvector)
-    return torch.tensor(xvector).unsqueeze(0)
+    # Fill lists
+    for result in results:
+        for key in keys:
+            if key == "prosody" and "prosody" in result and isinstance(result["prosody"], dict):
+                for pkey, pval in result["prosody"].items():
+                    if isinstance(pval, (int, float)):
+                        value_lists[f"prosody.{pkey}"].append(pval)
+            elif key == "features" and "features" in result and isinstance(result["features"], (list, tuple)):
+                value_lists["features"].append(result["features"])
+            elif key in result and isinstance(result[key], (int, float)):
+                value_lists[key].append(result[key])
 
-# -----------------------------
-# Adapter weight updater
-# -----------------------------
-def update_emotion_adapters(model, dataset: list, save_dir: str):
-    texts = [item["text"] for item in dataset]
-    emotions = [item["major_emotion"] for item in dataset]
+    # Calculate means for normal keys and prosody
+    for key, vals in value_lists.items():
+        if key == "features" and vals:
+            # Transpose list of lists to get per-index values
+            features_arr = list(zip(*vals))
+            for i, feature_vals in enumerate(features_arr):
+                mean_results[f"mean_features_{i}"] = sum(feature_vals) / len(feature_vals)
+                mean_results[f"all_features_{i}"] = list(feature_vals)
+            mean_results["all_features"] = vals
+        elif vals:
+            mean_results[f"mean_{key}"] = sum(vals) / len(vals)
+            mean_results[f"all_{key}"] = vals
 
-    # ✅ Convert features back into torch tensors
-    features_list = [
-        torch.tensor(item["features"], dtype=torch.float32)
-        if isinstance(item["features"], (list, tuple)) else item["features"]
-        for item in dataset
-    ]
+    # Save to JSON file
+    with open(save_path, 'w') as f:
+        json.dump(mean_results, f, indent=4)
 
-    ds = Dataset.from_dict({"text": texts, "emotion": emotions})
-    dataloader = DataLoader(ds, batch_size=1)
-
-    for i, batch in enumerate(dataloader):
-        emotion = batch["emotion"][0]
-        features = features_list[i]
-
-        adapter_dir = os.path.join(save_dir, emotion, emotion)
-        model_peft = PeftModel.from_pretrained(model, adapter_dir, adapter_name=emotion)
-
-        # ✅ Unfreeze LoRA parameters
-        for name, param in model_peft.named_parameters():
-            if "lora" in name:
-                param.requires_grad = True
-
-        print(f"🔄 Updating adapter for [{emotion}]...")
-
-        for name, param in model_peft.named_parameters():
-            if "lora" in name and param.requires_grad:
-                before = param.data.clone().detach().cpu()
-                param.data += 0.01 * features.mean()
-                after = param.data.clone().detach().cpu()
-
-                print(f"➡️ {name}: Δmean={after.mean() - before.mean():.8f}")
-
-        # Save updated adapter
-        model_peft.save_pretrained(adapter_dir, safe_serialization=True)
-
-# -----------------------------
-# Main Example
-# -----------------------------
-if __name__ == "__main__":
-    # Load dataset and convert features back
-    dataset_path = "results.json"   # <-- put your dataset JSON file here
-    with open(dataset_path, "r") as f:
-        dataset = json.load(f)
-
-    dataset = dataset[:10]
-
-    # (Already handled above inside update_emotion_adapters)
-    save_dir = "models"
-
-    # Create adapters first (one per emotion)
-    unique_emotions = set(item["major_emotion"] for item in dataset)
-    for emotion in unique_emotions:
-        _ = get_tone_adapter(base_model, emotion, save_dir=save_dir)
-
-    # Update weights with features
-    update_emotion_adapters(base_model, dataset, save_dir=save_dir)
+    print(f"Mean results saved to {save_path}")
 
 
-def test_prosody_shift(sample, base_model, processor, vocoder, whisper_model, save_dir, n_trials=5):
-    emotion = sample["major_emotion"]
-    text = sample["text"]
-
-    inputs = processor(text=text, return_tensors="pt")
-    speaker_embeddings = get_speaker_embedding()
-
-    results = {"baseline": [], "adapter": []}
-
-    # 1) Baseline (no adapter)
-    for i in range(n_trials):
-        out_path = f"speech_baseline_{i}.wav"
-        speech = base_model.generate_speech(
-            inputs["input_ids"],
-            speaker_embeddings,
-            vocoder=vocoder
-        )
-        sf.write(out_path, speech.numpy(), samplerate=16000)
-
-        feats = extract_prosody_features(out_path, whisper_model)
-        results["baseline"].append(feats)
-
-    # 2) Adapter
-    model_with_adapter = get_tone_adapter(base_model, emotion, save_dir=save_dir)
-    for i in range(n_trials):
-        out_path = f"speech_{emotion}_{i}.wav"
-        speech = model_with_adapter.generate_speech(
-            inputs["input_ids"],
-            speaker_embeddings,
-            vocoder=vocoder
-        )
-        sf.write(out_path, speech.numpy(), samplerate=16000)
-
-        feats = extract_prosody_features(out_path, whisper_model)
-        results["adapter"].append(feats)
-
-    # Average results
-    def mean_dict(list_of_dicts):
-        keys = list(list_of_dicts[0].keys())
-        return {k: float(np.mean([d[k] for d in list_of_dicts])) for k in keys}
-
-    mean_baseline = mean_dict(results["baseline"])
-    mean_adapter = mean_dict(results["adapter"])
-
-    print("\n📊 Prosody comparison:")
-    print(f"Emotion: {emotion}")
-    print("Baseline:", mean_baseline)
-    print("Adapter :", mean_adapter)
-
-    return mean_baseline, mean_adapter
+def calculate_prosody_features(audio_path, whisper_model, embedding_model, sentiment_pipeline):
+    """
+    Given an audio file path, calculate prosody features using the provided models.
+    Returns a dictionary of prosody features.
+    """
+    data = {}
+    text = voice_to_text(audio_path, whisper_model)
+    prosody = extract_prosody_features(audio_path, whisper_model)
+    features = extract_implicit_features(text, embedding_model, sentiment_pipeline, prosody, only_voice_test=True)
+    data["prosody"] = prosody
+    data["features"] = features
+    return data
 
 
-
-whisper_model = whisper.load_model("base")
-sample = dataset[0]  # or loop over dataset
-baseline_feats, adapter_feats = test_prosody_shift(
-    sample,
+def generate_and_store_speech(
+    dataset,
     base_model,
     processor,
     vocoder,
-    whisper_model,
+    get_speaker_embedding,
+    get_tone_adapter,
     save_dir,
-    n_trials=5
-)
+    base_dir="audios",
+    limit=None
+):
+    """
+    Generate baseline and adapter-based speech samples from a dataset,
+    save audio files and corresponding metrics in structured directories.
+    """
+    os.makedirs(base_dir, exist_ok=True)
+
+    for idx, sample in enumerate(dataset if limit is None else dataset[:limit]):
+        process_sample(idx, sample, base_model, processor, vocoder, 
+                       get_speaker_embedding, get_tone_adapter, save_dir, base_dir)
+
+
+def process_sample(idx, sample, base_model, processor, vocoder, 
+                  get_speaker_embedding, get_tone_adapter, save_dir, base_dir):
+    """Process a single dataset sample for speech generation"""
+    emotion = sample["major_emotion"]
+    text = sample["text"]
+    gender = sample.get("gender", "female").lower()
+    
+    # Get sampling rate
+    sr = get_sampling_rate(sample)
+    
+    # Get inputs for model
+    inputs = processor(text=text, return_tensors="pt")
+    speaker_embeddings = get_speaker_embedding(gender=gender)
+    
+    # Extract metrics from sample
+    extra_metrics = extract_metrics_from_sample(sample)
+    
+    # Generate speech for each fold
+    for fold in range(1, 4):
+        # Generate baseline speech
+        generate_speech_type(
+            "baseline", idx, fold, text, gender, emotion, "neutral",
+            base_model, None, inputs, speaker_embeddings, vocoder, 
+            sr, base_dir, extra_metrics
+        )
+        
+        # Generate adapter speech
+        adapter_model = get_tone_adapter(base_model, emotion, gender, save_dir=save_dir)
+        generate_speech_type(
+            "adapter", idx, fold, text, gender, emotion, emotion,
+            base_model, adapter_model, inputs, speaker_embeddings, vocoder, 
+            sr, base_dir, extra_metrics
+        )
+
+
+def get_sampling_rate(sample):
+    """Extract sampling rate from sample or use default"""
+    sr = 16000  # Default
+    audio_info = sample.get("audio", {})
+    audio_path = audio_info.get("path")
+    
+    if audio_path is None or not os.path.isfile(audio_path):
+        arr, sr = audio_info.get("array"), audio_info.get("sampling_rate", 16000)
+    else:
+        try:
+            sr = sf.info(audio_path).samplerate
+        except Exception:
+            sr = 16000
+    return sr
+
+
+def extract_metrics_from_sample(sample):
+    """Extract standard metrics from a sample"""
+    return {
+        "major_emotion": sample.get("major_emotion"),
+        "gender": sample.get("gender"),
+        "EmoAct": sample.get("EmoAct"),
+        "EmoVal": sample.get("EmoVal"),
+        "EmoDom": sample.get("EmoDom"),
+        "speaking_rate": sample.get("speaking_rate"),
+        "pitch_mean": sample.get("pitch_mean"),
+        "pitch_std": sample.get("pitch_std"),
+        "rms": sample.get("rms"),
+        "relative_db": sample.get("relative_db"),
+    }
+
+
+def generate_speech_type(
+    speech_type, idx, fold, text, gender, source_emotion, output_emotion,
+    base_model, adapter_model, inputs, speaker_embeddings, vocoder,
+    sr, base_dir, extra_metrics
+):
+    """Generate a specific type of speech (baseline or adapter)"""
+    print(f"[{idx}] 🎤 Generating {speech_type} speech for [{source_emotion}] [{gender}], fold {fold}...")
+    
+    # Use the appropriate model for generation
+    model_to_use = adapter_model if adapter_model else base_model
+    speech = model_to_use.generate_speech(
+        inputs["input_ids"],
+        speaker_embeddings,
+        vocoder=vocoder
+    )
+
+    # Setup directories and paths
+    output_dir = os.path.join(base_dir, speech_type, gender)
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"{idx}_{fold}_{speech_type}.wav")
+    
+    # Save the audio file
+    sf.write(output_path, speech.numpy(), samplerate=sr)
+    print(f"✅ Saved {speech_type} speech at {output_path}")
+    
+    # Calculate prosody features
+    prosody_data = calculate_prosody_features(output_path, whisper_model, embedding_model, sentiment_pipeline)
+    
+    # Create and save metrics
+    metrics = {
+        "id": idx,
+        "fold": fold,
+        "text": text,
+        "emotion": output_emotion,
+        "gender": gender,
+        "relative_path": os.path.relpath(output_path, start=base_dir),
+        "params": {
+            "samplerate": sr,
+            "length": len(speech.numpy())
+        },
+        "prosody": prosody_data.get("prosody", {}),
+        "features": prosody_data.get("features", []),
+        **extra_metrics
+    }
+    
+    metrics_path = os.path.join(output_dir, f"metrics_{idx}_{fold}_{speech_type}.json")
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=4)
+
